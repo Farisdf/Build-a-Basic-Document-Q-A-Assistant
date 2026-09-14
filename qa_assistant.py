@@ -6,10 +6,10 @@ A small retrieval-augmented generation (RAG) pipeline over local text documents.
 
 Pipeline (see ``ask``):
     load docs -> chunk -> embed (all-MiniLM-L6-v2) -> cosine-similarity retrieval (top 4)
-    -> build a citation-labelled prompt -> call Claude -> validate strict-JSON output with
+    -> build a citation-labelled prompt -> call Gemini -> validate strict-JSON output with
     Pydantic (one retry on failure) -> print answer + citations + retrieved chunks.
 
-The API key is read ONLY from the ``ANTHROPIC_API_KEY`` environment variable (optionally
+The API key is read ONLY from the ``GEMINI_API_KEY`` environment variable (optionally
 loaded from a local ``.env`` file via python-dotenv). It is never hard-coded.
 """
 
@@ -33,7 +33,9 @@ from pydantic import BaseModel, ValidationError
 
 DOCS_DIR = Path(__file__).parent / "docs"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-LLM_MODEL = "claude-sonnet-4-6"
+# gemini-2.5-flash was requested, but the API returns 404 "no longer available to new users"
+# for it and names gemini-3.6-flash as the replacement, so that is what is used here.
+LLM_MODEL = "gemini-3.6-flash"
 TOP_K = 4
 MAX_CHUNK_WORDS = 200  # target upper bound for a chunk; paragraphs are merged up to this
 
@@ -235,17 +237,17 @@ def build_prompt(question: str, retrieved: list[RetrievedChunk]) -> str:
 
 
 def _get_client():
-    """Create an Anthropic client. The key comes only from the environment."""
-    import anthropic
+    """Create a Gemini client. The key comes only from the environment."""
+    from google import genai
 
     load_dotenv()  # loads .env into os.environ if the file exists; no-op otherwise
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "ANTHROPIC_API_KEY is not set. Put it in a .env file (see .env.example) "
+            "GEMINI_API_KEY is not set. Put it in a .env file (see .env.example) "
             "or export it in your shell before running."
         )
-    return anthropic.Anthropic(api_key=api_key)
+    return genai.Client(api_key=api_key)
 
 
 def _extract_json(raw: str) -> str:
@@ -271,64 +273,102 @@ def parse_response(raw: str, n_passages: int) -> QAResponse:
     return resp
 
 
-def _message_text(message) -> str:
-    return "".join(block.text for block in message.content if block.type == "text")
+def _message_text(response) -> str:
+    """Concatenate the text parts of a Gemini response (empty string if it was blocked)."""
+    try:
+        return response.text or ""
+    except (AttributeError, ValueError):
+        return ""
+
+
+RATE_LIMIT_MAX_WAITS = 2  # how many times to wait out a 429 before giving up on a call
+
+
+def _generate_with_rate_limit_backoff(client, contents, config):
+    """
+    Call ``generate_content``; if the API answers 429 (quota / rate limit), sleep for the
+    delay it suggests (default 60 s) and try again, up to ``RATE_LIMIT_MAX_WAITS`` times.
+    Any other error propagates to the caller unchanged.
+    """
+    import time
+
+    from google.genai import errors
+
+    for wait_no in range(RATE_LIMIT_MAX_WAITS + 1):
+        try:
+            return client.models.generate_content(model=LLM_MODEL, contents=contents, config=config)
+        except errors.ClientError as e:
+            if e.code != 429 or wait_no == RATE_LIMIT_MAX_WAITS:
+                raise
+            m = re.search(r"retry in ([\d.]+)s", str(e.message), flags=re.IGNORECASE)
+            delay = min(float(m.group(1)) + 1.0, 90.0) if m else 60.0
+            print(f"[info] Rate limited (429); waiting {delay:.0f}s before retrying ...", file=sys.stderr)
+            time.sleep(delay)
 
 
 def call_llm(prompt: str, n_passages: int, client=None) -> tuple[QAResponse | None, str, bool]:
     """
-    Call Claude with ``prompt``; parse the strict-JSON reply into ``QAResponse``.
+    Call Gemini with ``prompt``; parse the strict-JSON reply into ``QAResponse``.
 
     On a parse/validation failure the call is retried ONCE with a clarifying follow-up
     instruction. Returns ``(parsed_or_None, last_raw_text, validation_passed)``.
     """
-    import anthropic
+    from google.genai import errors, types
 
     client = client or _get_client()
-    messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        max_output_tokens=2048,
+        temperature=0,
+        response_mime_type="application/json",  # ask the model for JSON-only output
+    )
+    contents: list[Any] = [types.Content(role="user", parts=[types.Part.from_text(text=prompt)])]
     raw = ""
 
     for attempt in (1, 2):
         try:
-            message = client.messages.create(
-                model=LLM_MODEL,
-                max_tokens=1024,
-                system=SYSTEM_PROMPT,
-                messages=messages,
-            )
-        except anthropic.RateLimitError as e:
-            print(f"[error] Rate limited by the API: {e}", file=sys.stderr)
+            response = _generate_with_rate_limit_backoff(client, contents, config)
+        except errors.ClientError as e:
+            if e.code == 429:
+                print(f"[error] Rate limited by the API: {e.message}", file=sys.stderr)
+            else:
+                print(f"[error] API returned status {e.code}: {e.message}", file=sys.stderr)
             return None, raw, False
-        except anthropic.APIStatusError as e:
-            print(f"[error] API returned status {e.status_code}: {e.message}", file=sys.stderr)
+        except errors.ServerError as e:
+            print(f"[error] API server error {e.code}: {e.message}", file=sys.stderr)
             return None, raw, False
-        except anthropic.APIConnectionError as e:
-            print(f"[error] Could not reach the API: {e}", file=sys.stderr)
+        except errors.APIError as e:
+            print(f"[error] API error: {e}", file=sys.stderr)
             return None, raw, False
 
-        if message.stop_reason == "refusal":
-            print("[error] The model declined to answer this request.", file=sys.stderr)
+        feedback = getattr(response, "prompt_feedback", None)
+        if feedback is not None and getattr(feedback, "block_reason", None):
+            print(f"[error] The model declined this request ({feedback.block_reason}).", file=sys.stderr)
             return None, raw, False
 
-        raw = _message_text(message)
+        raw = _message_text(response)
         try:
             return parse_response(raw, n_passages), raw, True
         except (json.JSONDecodeError, ValidationError, ValueError) as e:
             print(f"[warn] attempt {attempt}: response failed validation ({e}).", file=sys.stderr)
             if attempt == 1:
                 # Feed the bad reply back and ask for a corrected, format-compliant answer.
-                messages.append({"role": "assistant", "content": raw or "(empty)"})
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "Your previous reply was not valid. It must be a single strict JSON "
-                            'object of the form {"answer": "string", "citations": [1, 3]} with '
-                            "no code fences and no extra text. \"citations\" must be a list of "
-                            f"integers between 1 and {n_passages} (or [] if you don't know). "
-                            "Please resend the corrected JSON only."
-                        ),
-                    }
+                contents.append(types.Content(role="model", parts=[types.Part.from_text(text=raw or "(empty)")]))
+                contents.append(
+                    types.Content(
+                        role="user",
+                        parts=[
+                            types.Part.from_text(
+                                text=(
+                                    "Your previous reply was not valid. It must be a single strict JSON "
+                                    'object of the form {"answer": "string", "citations": [1, 3]} with '
+                                    "no code fences and no extra text. \"citations\" must be a list of "
+                                    f"integers between 1 and {n_passages} (or [] if you don't know). "
+                                    "Please resend the corrected JSON only."
+                                )
+                            )
+                        ],
+                    )
                 )
 
     return None, raw, False

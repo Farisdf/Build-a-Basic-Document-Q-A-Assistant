@@ -19,7 +19,7 @@ question  ──►  embed  ──►  cosine similarity  ──►  top-4 chunk
                      prompt = numbered passages [1]..[4] + question + "answer only from passages,
                               say I don't know otherwise, reply in strict JSON"
                                                               │
-                     Claude (claude-sonnet-4-6)  ──►  {"answer": "...", "citations": [1, 3]}
+                     Gemini (gemini-3.6-flash)  ──►  {"answer": "...", "citations": [1, 3]}
                                                               │
                      Pydantic QAResponse validation  ──►  retry once on failure  ──►  print
 ```
@@ -34,8 +34,8 @@ Key points:
 - **Retrieval** – the question is embedded with the same model; cosine similarity is a dot
   product against the array; the top 4 chunks are returned. Only those 4 chunks are sent to
   the LLM, never the whole corpus.
-- **LLM call** – Anthropic Python SDK, model `claude-sonnet-4-6`. The API key is read only from
-  the `ANTHROPIC_API_KEY` environment variable (optionally loaded from `.env`).
+- **LLM call** – Google `google-genai` SDK, model `gemini-3.6-flash`. The API key is read only from
+  the `GEMINI_API_KEY` environment variable (optionally loaded from `.env`).
 - **Strict JSON + validation** – the model is told to return
   `{"answer": "string", "citations": [1, 3]}`. The reply is parsed into a Pydantic
   `QAResponse`. If parsing or validation fails (bad JSON, wrong types, citation numbers
@@ -80,13 +80,13 @@ The first run downloads the `all-MiniLM-L6-v2` model (~90 MB) from Hugging Face 
 
 ## Setting the API key
 
-The assistant reads `ANTHROPIC_API_KEY` from the environment and nowhere else. Two options:
+The assistant reads `GEMINI_API_KEY` from the environment and nowhere else. Two options:
 
 **Option A – `.env` file (loaded automatically by python-dotenv)**
 
 ```bash
 cp .env.example .env
-# then edit .env and put your real key after ANTHROPIC_API_KEY=
+# then edit .env and put your real key after GEMINI_API_KEY=
 ```
 
 `.env` is listed in `.gitignore`, so it is never committed.
@@ -95,13 +95,13 @@ cp .env.example .env
 
 ```bash
 # macOS / Linux
-export ANTHROPIC_API_KEY=sk-ant-...
+export GEMINI_API_KEY=AIza...
 
 # Windows PowerShell
-$env:ANTHROPIC_API_KEY = "sk-ant-..."
+$env:GEMINI_API_KEY = "AIza..."
 
 # Windows cmd
-set ANTHROPIC_API_KEY=sk-ant-...
+set GEMINI_API_KEY=AIza...
 ```
 
 ## Running the assistant
